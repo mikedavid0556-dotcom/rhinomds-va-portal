@@ -30,6 +30,20 @@ app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public")));
 
+// ================= REAL-TIME SSE CLIENTS =================
+const sseClients = new Set();
+
+function broadcastSync(filterFn, payload) {
+  const msg = `event: sync\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      if (!filterFn || filterFn(client.user)) {
+        client.res.write(msg);
+      }
+    } catch {}
+  }
+}
+
 const SEED = {
   users: [
     {"name": "Waqar Ahmad", "lead": "Umer Ibrahim", "status": "Active"},
@@ -357,6 +371,28 @@ function requireRole(...roles) {
   };
 }
 
+// Live SSE Stream
+app.get("/api/events", requireAuth, (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  res.write(`event: connected\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+
+  const client = { user: req.user, res };
+  sseClients.add(client);
+
+  const heartbeat = setInterval(() => {
+    try { res.write(": ping\n\n"); } catch {}
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(client);
+  });
+});
+
 app.post("/api/auth/login", async (req, res) => {
   const selectedRole = String(req.body.role || "");
   const username = String(req.body.username || "").trim().toLowerCase();
@@ -501,6 +537,7 @@ app.post("/api/users", requireAuth, requireRole("super_admin"), async (req, res)
        RETURNING id, name`,
       [first_name, last_name, name, dob, pseudo_name, email, designation, username, hash, role, effectiveLead, status]
     );
+    broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
     res.json({ user: rows[0] });
   } catch (err) {
     if (err.code === "23505") return res.status(409).json({ error: "Full name or username already exists" });
@@ -554,6 +591,7 @@ app.put("/api/users/:id", requireAuth, requireRole("super_admin"), async (req, r
       await client.query("INSERT INTO leads (name) VALUES ($1) ON CONFLICT DO NOTHING", [lead]);
     }
     await client.query("COMMIT");
+    broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
     res.json({ ok: true });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -574,17 +612,20 @@ app.delete("/api/users/:id", requireAuth, requireRole("super_admin"), async (req
     await pool.query("DELETE FROM tasks WHERE assigned_to_id = $1 OR assigned_by_id = $1", [id]);
     await pool.query("DELETE FROM notifications WHERE recipient_id = $1", [id]);
   }
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.post("/api/assignments", requireAuth, requireRole("super_admin"), async (req, res) => {
   if (!req.body.user || !req.body.practice) return res.status(400).json({ error: "User and practice required" });
   await pool.query("INSERT INTO assignments (user_name, practice_name) VALUES ($1, $2) ON CONFLICT DO NOTHING", [req.body.user, req.body.practice]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.delete("/api/assignments", requireAuth, requireRole("super_admin"), async (req, res) => {
   await pool.query("DELETE FROM assignments WHERE user_name = $1 AND practice_name = $2", [req.body.user, req.body.practice]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
@@ -592,12 +633,14 @@ app.post("/api/practices", requireAuth, requireRole("super_admin"), async (req, 
   const practice = String(req.body.practice || "").trim();
   if (!practice) return res.status(400).json({ error: "Practice name required" });
   await pool.query("INSERT INTO practices (name) VALUES ($1) ON CONFLICT DO NOTHING", [practice]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.delete("/api/practices/:name", requireAuth, requireRole("super_admin"), async (req, res) => {
   await pool.query("DELETE FROM practices WHERE name = $1", [req.params.name]);
   await pool.query("DELETE FROM assignments WHERE practice_name = $1", [req.params.name]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
@@ -605,6 +648,7 @@ app.post("/api/leads", requireAuth, requireRole("super_admin"), async (req, res)
   const lead = String(req.body.lead || "").trim();
   if (!lead) return res.status(400).json({ error: "Row lead name required" });
   await pool.query("INSERT INTO leads (name) VALUES ($1) ON CONFLICT DO NOTHING", [lead]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
@@ -612,12 +656,14 @@ app.delete("/api/leads/:name", requireAuth, requireRole("super_admin"), async (r
   const check = await pool.query("SELECT 1 FROM users WHERE lead = $1 LIMIT 1", [req.params.name]);
   if (check.rowCount > 0) return res.status(400).json({ error: "Reassign users before deleting this Row Lead" });
   await pool.query("DELETE FROM leads WHERE name = $1", [req.params.name]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.put("/api/settings", requireAuth, requireRole("super_admin"), async (req, res) => {
   await pool.query("INSERT INTO settings (key, value) VALUES ('targets', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.targets)]);
   await pool.query("INSERT INTO settings (key, value) VALUES ('weights', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.weights)]);
+  broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "Scoring settings updated by Admin" });
   res.json({ ok: true });
 });
 
@@ -628,7 +674,7 @@ app.post("/api/signoffs", requireAuth, async (req, res) => {
   let targetUserName = String(req.body.user || "");
   if (req.user.role === "user") targetUserName = req.user.name;
 
-  const targetRes = await pool.query("SELECT name, lead FROM users WHERE name = $1", [targetUserName]);
+  const targetRes = await pool.query("SELECT id, name, lead FROM users WHERE name = $1", [targetUserName]);
   if (!targetRes.rows[0]) return res.status(404).json({ error: "Employee not found" });
   const target = targetRes.rows[0];
 
@@ -662,6 +708,42 @@ app.post("/api/signoffs", requireAuth, async (req, res) => {
     `INSERT INTO signoff_logs (signoff_date, user_name, updated_by, updated_by_role, vobs, calls, scheduling, payments, extra, notes)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
     [date, target.name, updaterName, updaterRole, vobs, calls, scheduling, payments, extra, notes]
+  );
+
+  // Create persistent notifications for Admin, Row Lead, and target User (excluding the actor)
+  const recipients = new Set();
+  const admins = await pool.query("SELECT id FROM users WHERE role = 'super_admin' AND status = 'Active'");
+  admins.rows.forEach((a) => recipients.add(a.id));
+  if (target.lead) {
+    const leads = await pool.query(
+      "SELECT id FROM users WHERE role = 'row_lead' AND status = 'Active' AND (lead = $1 OR name = $1)",
+      [target.lead]
+    );
+    leads.rows.forEach((l) => recipients.add(l.id));
+  }
+  recipients.add(target.id);
+
+  const notifTitle = `Sign-Off Updated: ${target.name} (${date})`;
+  const notifMsg = `${updaterName} (${updaterRole}) updated sign-off for ${target.name} on ${date} — VOBs: ${vobs}, Calls: ${calls}, Sched: ${scheduling}, Payments: $${payments.toFixed(2)}, Extra: ${extra}.`;
+  for (const recId of recipients) {
+    if (recId === req.user.id) continue;
+    await pool.query(
+      "INSERT INTO notifications (recipient_id, type, title, message) VALUES ($1, 'signoff_updated', $2, $3)",
+      [recId, notifTitle, notifMsg]
+    );
+  }
+
+  // Push live update to Admin, that Row Lead's team lead, and the target user
+  broadcastSync(
+    (u) =>
+      u.role === "super_admin" ||
+      (u.role === "row_lead" && (u.lead || u.name) === (target.lead || "")) ||
+      u.id === target.id,
+    {
+      type: "signoff_updated",
+      actorId: req.user.id,
+      toast: `${updaterName} updated sign-off for ${target.name} (${date})`
+    }
   );
 
   res.json({ ok: true });
@@ -715,6 +797,18 @@ app.post("/api/tasks", requireAuth, requireRole("super_admin", "row_lead"), asyn
     [target.id, `New Task Assigned: ${title}`, `${req.user.name} (${roleLabel(req.user.role)}) assigned you a task. Timeframe: ${timeframe}. Details: ${description}`]
   );
 
+  broadcastSync(
+    (u) =>
+      u.id === target.id ||
+      u.role === "super_admin" ||
+      (u.role === "row_lead" && (u.lead || u.name) === (target.lead || "")),
+    {
+      type: "task_assigned",
+      actorId: req.user.id,
+      toast: `New task "${title}" assigned to ${target.name}`
+    }
+  );
+
   res.json({ task: rows[0] });
 });
 
@@ -757,6 +851,18 @@ app.post("/api/tasks/:id/complete", requireAuth, async (req, res) => {
       [recId, `Task Completed by ${task.assigned_to_name}`, msg]
     );
   }
+
+  broadcastSync(
+    (u) =>
+      u.id === task.assigned_to_id ||
+      u.role === "super_admin" ||
+      (u.role === "row_lead" && (u.lead || u.name) === (task.assigned_to_lead || "")),
+    {
+      type: "task_completed",
+      actorId: req.user.id,
+      toast: `${task.assigned_to_name} completed task "${task.title}"`
+    }
+  );
 
   res.json({ ok: true });
 });
@@ -982,6 +1088,7 @@ app.post("/api/backup/restore", requireAuth, requireRole("super_admin"), async (
     if (b.targets) await client.query("INSERT INTO settings (key, value) VALUES ('targets', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.targets)]);
     if (b.weights) await client.query("INSERT INTO settings (key, value) VALUES ('weights', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.weights)]);
     await client.query("COMMIT");
+    broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "Database restored by Admin" });
     res.json({ ok: true });
   } catch (err) {
     await client.query("ROLLBACK");
