@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -63,6 +61,8 @@ button:hover{filter:brightness(1.06)}button.secondary{background:#e2e8f0;color:#
 .bento-header{background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 58%,#0d9488 100%);color:#fff;padding:18px 28px 22px;box-shadow:0 10px 30px rgba(15,23,42,.15)}
 .bento-top{max-width:1480px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
 .user-chip{display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);padding:7px 13px;border-radius:99px;font-size:12px;color:#fff}
+.live-dot{width:8px;height:8px;border-radius:50%;background:#34d399;box-shadow:0 0 8px #34d399;display:inline-block}
+.live-dot.off{background:#f59e0b;box-shadow:none}
 .bell-btn{position:relative;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);color:#fff;padding:8px 13px;border-radius:99px;font-size:13px}
 .bell-badge{position:absolute;top:-5px;right:-4px;background:#ef4444;color:#fff;font-size:10px;font-weight:800;min-width:18px;height:18px;border-radius:99px;display:grid;place-items:center;padding:0 5px}
 .bento-nav{max-width:1480px;margin:16px auto 0;display:flex;gap:8px;flex-wrap:wrap}
@@ -77,9 +77,9 @@ main{padding:26px 28px;max-width:1480px;width:100%;margin:0 auto}
 .top-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .date-pill{background:#fff;border:1px solid var(--line);padding:8px 13px;border-radius:10px;color:var(--muted);font-size:12px;font-weight:600}
 
-/* Birthday Banner */
 .bday-banner{background:linear-gradient(135deg,#7c3aed,#ec4899);color:#fff;border-radius:16px;padding:16px 20px;margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 12px 26px rgba(124,58,237,.22)}
 .bday-banner strong{font-size:16px;display:block}
+.sync-banner{background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46;border-radius:12px;padding:10px 14px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px}
 
 .grid{display:grid;gap:16px}.kpis{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:var(--shadow);min-width:0}
@@ -97,7 +97,7 @@ table{border-collapse:collapse;width:100%;font-size:12px}th{text-align:left;back
 .form-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.form-grid .wide{grid-column:span 2}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}
 .calendar-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}.calendar div{padding:9px 4px;text-align:center;font-size:11px;border-radius:8px}.calendar .dow{color:var(--muted);font-weight:800}.calendar .day{background:#f1f5f9;cursor:pointer}.calendar .day:hover{background:#dbeafe}.calendar .selected{background:var(--accent);color:#fff}.calendar .today{outline:1px solid var(--accent)}.calendar .has-data:after{content:"";display:block;width:4px;height:4px;border-radius:50%;background:#e49b35;margin:3px auto 0}
 .score{font-size:18px;font-weight:800;color:var(--ink)}.rank{font-size:17px;font-weight:850;color:var(--ink)}.notice{background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:12px;color:#1e40af;font-size:12px;margin-bottom:14px}
-.toast{position:fixed;right:22px;bottom:22px;background:#0f172a;color:#fff;padding:12px 16px;border-radius:10px;box-shadow:var(--shadow);opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;z-index:80}.toast.show{opacity:1;transform:translateY(0)}
+.toast{position:fixed;right:22px;bottom:22px;background:#0f172a;color:#fff;padding:12px 16px;border-radius:10px;box-shadow:0 12px 28px rgba(0,0,0,.22);opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;z-index:80;max-width:400px}.toast.show{opacity:1;transform:translateY(0)}
 .modal-bg{position:fixed;inset:0;background:rgba(15,23,42,.55);display:none;place-items:center;padding:20px;z-index:60}.modal-bg.open{display:grid}.modal{background:#fff;border-radius:16px;padding:24px;width:100%;max-width:620px;max-height:88vh;overflow:auto;box-shadow:0 20px 50px rgba(0,0,0,.2)}
 .notif-item{padding:12px;border:1px solid var(--line);border-radius:12px;margin-bottom:8px;background:#fff}
 .notif-item.unread{background:#eff6ff;border-color:#93c5fd}
@@ -127,6 +127,9 @@ let state = null;
 let currentPage = "dashboard";
 let introPlayed = false;
 let loginRole = "user";
+let liveSource = null;
+let liveConnected = false;
+let pendingRender = false;
 const todayISO = () => { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 let selectedDate = todayISO(), monthSelected = todayISO(), reviewFilters = {from:"",to:"",lead:"",user:"",q:"",status:"All"};
 
@@ -141,7 +144,13 @@ const pages = {
   settings: "Settings & Backup"
 };
 
-function toast(s){ const t=document.getElementById("toast"); t.textContent=s; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2800); }
+let toastTimer = null;
+function toast(s){
+  const t=document.getElementById("toast");
+  t.textContent=s; t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>t.classList.remove("show"),3800);
+}
 function esc(s){ return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function num(v){ return Number(v)||0; }
 function money(v){ return "$"+num(v).toLocaleString(undefined,{maximumFractionDigits:2}); }
@@ -156,9 +165,82 @@ async function api(url, opts={}) {
   return data;
 }
 
-function closeModal(){ document.getElementById("modalBg").classList.remove("open"); }
+function closeModal(){
+  document.getElementById("modalBg").classList.remove("open");
+  if (pendingRender) { pendingRender = false; render(currentPage); }
+}
 function openModal(html){ document.getElementById("modalBox").innerHTML = html; document.getElementById("modalBg").classList.add("open"); }
 document.getElementById("modalBg").onclick = (e) => { if(e.target.id === "modalBg") closeModal(); };
+
+function isUserTypingInView() {
+  const el = document.activeElement;
+  const view = document.getElementById("view");
+  return Boolean(el && view && view.contains(el) && ["INPUT","TEXTAREA","SELECT"].includes(el.tagName));
+}
+
+function updateLiveHeaderBadges() {
+  if (!state) return;
+  const unreadCount = (state.notifications || []).filter(n => !n.is_read).length;
+  const pendingTasks = (state.tasks || []).filter(t => t.assigned_to_id === state.currentUser.id && t.status !== "Completed").length;
+  const bellBtn = document.getElementById("bellBtn");
+  if (bellBtn) bellBtn.innerHTML = `🔔 Alerts ${unreadCount ? `<span class="bell-badge">${unreadCount}</span>` : ""}`;
+  const taskNavBtn = document.querySelector('#nav button[data-page="tasks"]');
+  if (taskNavBtn) taskNavBtn.textContent = `Tasks${pendingTasks ? ` (${pendingTasks})` : ""}`;
+  const dot = document.getElementById("liveDot");
+  if (dot) dot.classList.toggle("off", !liveConnected);
+}
+
+function connectLiveEvents() {
+  if (liveSource) liveSource.close();
+  liveSource = new EventSource("/api/events");
+  liveSource.addEventListener("connected", () => { liveConnected = true; updateLiveHeaderBadges(); });
+  liveSource.onerror = () => { liveConnected = false; updateLiveHeaderBadges(); };
+
+  liveSource.addEventListener("sync", async (e) => {
+    let payload = {};
+    try { payload = JSON.parse(e.data || "{}"); } catch {}
+    if (payload.actorId && state && payload.actorId === state.currentUser.id) return;
+
+    try {
+      state = await api("/api/bootstrap");
+      updateLiveHeaderBadges();
+      if (payload.toast) toast("🔔 " + payload.toast);
+
+      const modalOpen = document.getElementById("modalBg").classList.contains("open");
+      if (modalOpen || isUserTypingInView()) {
+        pendingRender = true;
+        const banner = document.getElementById("pendingSyncBanner");
+        if (banner) banner.style.display = "flex";
+      } else {
+        pendingRender = false;
+        render(currentPage);
+      }
+    } catch {
+      // Session ended or deactivated -> return to login
+      disconnectLiveEvents();
+      state = null;
+      renderLogin("Your session ended or account status changed.", false);
+    }
+  });
+}
+
+function disconnectLiveEvents() {
+  if (liveSource) { liveSource.close(); liveSource = null; }
+  liveConnected = false;
+}
+
+// Refresh automatically if user returns to tab after sleep/switch
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "visible" && state) {
+    try {
+      state = await api("/api/bootstrap");
+      updateLiveHeaderBadges();
+      if (!document.getElementById("modalBg").classList.contains("open") && !isUserTypingInView()) {
+        render(currentPage);
+      }
+    } catch {}
+  }
+});
 
 async function boot() {
   try {
@@ -166,7 +248,9 @@ async function boot() {
     introPlayed = true;
     renderAppShell();
     setPage(currentPage);
+    if (!liveSource) connectLiveEvents();
   } catch {
+    disconnectLiveEvents();
     renderLogin("", !introPlayed);
   }
 }
@@ -208,10 +292,10 @@ function renderLogin(errMsg="", withIntro=false) {
         ${LOGO_HTML}
         <div class="eyebrow-pill">● Medical Virtual Assistant Department</div>
         <h2 class="hero-title">Centralized Medical VA Performance & Sign-Off Hub</h2>
-        <p style="margin:0;color:#cbd5e1;font-size:15px">Track daily VOBs, patient outreach, scheduling, collections, team tasks, and bonus scorecards in one secure live portal.</p>
+        <p style="margin:0;color:#cbd5e1;font-size:15px">Track daily VOBs, patient outreach, scheduling, collections, team tasks, and bonus scorecards in real time.</p>
         <div class="bento-grid">
-          <div class="glass-card"><small>Daily Tracking</small><strong>Sign-Offs & Audit Logs</strong><span>Full record of updates & Excel/PDF reports</span></div>
-          <div class="glass-card"><small>Team Collaboration</small><strong>Tasks & Notifications</strong><span>Task alerts, birthday wishes & leaderboards</span></div>
+          <div class="glass-card"><small>Live Sync</small><strong>Real-Time Sign-Offs</strong><span>Auto-updates & full audit trail + Excel/PDF</span></div>
+          <div class="glass-card"><small>Team Collaboration</small><strong>Tasks & Instant Alerts</strong><span>Task alerts, birthday wishes & leaderboards</span></div>
         </div>
       </div>
       <div style="font-size:12px;color:#cbd5e1;margin-top:24px">© RhinoMDs Billing Services • Admin • Row Leads • Medical VAs</div>
@@ -304,6 +388,7 @@ function renderAppShell() {
         <span class="user-chip" style="font-weight:700">Medical Virtual Assistant Department</span>
       </div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="user-chip" title="Automatic real-time updates"><span class="live-dot ${liveConnected?"":"off"}" id="liveDot"></span> Live</span>
         <button class="bell-btn" id="bellBtn" title="Notifications">🔔 Alerts ${unreadCount ? `<span class="bell-badge">${unreadCount}</span>` : ""}</button>
         <span class="user-chip">Signed in: <strong>${esc(u.name)}</strong> (${roleLabel})</span>
         <button class="secondary small" id="logoutBtn">Log out</button>
@@ -314,6 +399,10 @@ function renderAppShell() {
     </nav>
   </header>
   <main>
+    <div class="sync-banner" id="pendingSyncBanner" style="display:none">
+      <span>🔄 <strong>New live updates arrived</strong> while you were editing.</span>
+      <button class="small" onclick="pendingRender=false;this.parentElement.style.display='none';render(currentPage)">Refresh View</button>
+    </div>
     <div class="page-head">
       <div>
         <div class="eyebrow">RhinoMDs Billing Services • Medical VA Department</div>
@@ -328,7 +417,12 @@ function renderAppShell() {
   </main>`;
 
   document.getElementById("nav").onclick = (e) => { const b = e.target.closest("button[data-page]"); if (b) setPage(b.dataset.page); };
-  document.getElementById("logoutBtn").onclick = async () => { await api("/api/auth/logout", { method: "POST" }); state = null; renderLogin("", false); };
+  document.getElementById("logoutBtn").onclick = async () => {
+    disconnectLiveEvents();
+    await api("/api/auth/logout", { method: "POST" });
+    state = null;
+    renderLogin("", false);
+  };
   document.getElementById("bellBtn").onclick = openNotificationsModal;
   const exp = document.getElementById("exportTop");
   if (exp) exp.onclick = exportBackup;
@@ -345,7 +439,7 @@ function openNotificationsModal() {
       ${list.length ? list.map(n => `
         <div class="notif-item ${n.is_read?"":"unread"}">
           <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
-            <strong>${n.type==="birthday"?"🎂 ":n.type==="task_completed"?"✅ ":"📌 "}${esc(n.title)}</strong>
+            <strong>${n.type==="birthday"?"🎂 ":n.type==="task_completed"?"✅ ":n.type==="signoff_updated"?"📝 ":"📌 "}${esc(n.title)}</strong>
             <span class="muted" style="font-size:11px">${new Date(n.created_at).toLocaleString()}</span>
           </div>
           <div style="font-size:12px;color:#334155">${esc(n.message)}</div>
@@ -394,7 +488,9 @@ async function refreshState() { state = await api("/api/bootstrap"); renderAppSh
 function setPage(page){
   if (!allowedPages().includes(page)) page = "dashboard";
   currentPage = page;
-  document.querySelectorAll("#nav button").forEach(b=>b.classList.toggle("active",b.dataset.page===page));
+  pendingRender = false;
+  const b = document.getElementById("pendingSyncBanner"); if (b) b.style.display = "none";
+  document.querySelectorAll("#nav button").forEach(x=>x.classList.toggle("active",x.dataset.page===page));
   document.getElementById("pageTitle").textContent = pages[page];
   render(page);
 }
@@ -429,7 +525,7 @@ async function dashboard(v){
 
   v.innerHTML = `
     ${birthdayBannerHTML()}
-    <div class="toolbar"><div class="field"><label>Dashboard month</label><input type="month" id="dashMonth" value="${m.slice(0,7)}"></div><span class="muted">Live RhinoMDs database metrics for selected month.</span></div>
+    <div class="toolbar"><div class="field"><label>Dashboard month</label><input type="month" id="dashMonth" value="${m.slice(0,7)}"></div><span class="muted">Live RhinoMDs database metrics (auto-updates automatically).</span></div>
     <div class="grid kpis">
       ${kpi("Visible VAs", vas.length, role==="user"?"Your profile":role==="row_lead"?"Your team":"Active Medical VAs")}
       ${kpi("VOBs Completed", sum(rows,"vobs"), "Selected month")}
@@ -502,10 +598,8 @@ function master(v){
 
   document.getElementById("userForm").onsubmit = async (e) => {
     e.preventDefault(); const f = new FormData(e.target);
-    try {
-      await api("/api/users", { method:"POST", body:JSON.stringify(Object.fromEntries(f.entries())) });
-      toast("Account created"); await refreshState();
-    } catch (err) { toast(err.message); }
+    try { await api("/api/users", { method:"POST", body:JSON.stringify(Object.fromEntries(f.entries())) }); toast("Account created"); await refreshState(); }
+    catch (err) { toast(err.message); }
   };
   document.getElementById("assignForm").onsubmit = async (e) => {
     e.preventDefault(); const f = new FormData(e.target);
@@ -557,10 +651,8 @@ function openEditUser(id) {
     </div><div class="actions"><button>Save Changes</button><button type="button" class="secondary" onclick="closeModal()">Cancel</button></div></form>`);
   document.getElementById("editUserForm").onsubmit = async (e) => {
     e.preventDefault(); const f = new FormData(e.target);
-    try {
-      await api(`/api/users/${id}`, { method:"PUT", body:JSON.stringify(Object.fromEntries(f.entries())) });
-      closeModal(); toast("Account & password updated"); await refreshState();
-    } catch (err) { toast(err.message); }
+    try { await api(`/api/users/${id}`, { method:"PUT", body:JSON.stringify(Object.fromEntries(f.entries())) }); closeModal(); toast("Account & password updated"); await refreshState(); }
+    catch (err) { toast(err.message); }
   };
 }
 
@@ -628,7 +720,7 @@ function signoff(v){
     const user = isVA ? state.currentUser.name : f.get("user");
     try {
       await api("/api/signoffs", { method:"POST", body:JSON.stringify({ date:selectedDate, user, vobs:num(f.get("vobs")), calls:num(f.get("calls")), scheduling:num(f.get("scheduling")), payments:num(f.get("payments")), extra:num(f.get("extra")), notes:f.get("notes")||"" }) });
-      window.signUserValue = user; toast("Sign-off & audit log saved"); await refreshState();
+      window.signUserValue = user; toast("Sign-off saved & team notified"); await refreshState();
     } catch (err) { toast(err.message); }
   };
 }
@@ -712,7 +804,7 @@ function tasks(v) {
     </section>` : ""}
 
     <section class="card" id="tasksTbl">
-      <div class="section-head"><h3>Task List (${(state.tasks||[]).length})</h3><span class="muted">Completing a task automatically notifies the user's Row Lead and Admin.</span></div>
+      <div class="section-head"><h3>Task List (${(state.tasks||[]).length})</h3><span class="muted">Live updates automatically notify assignee, Row Lead, and Admin.</span></div>
       ${table(["Task & Nature","Timeframe","Assigned To","Assigned By","Status","Action"], rows)}
     </section>
   `;
@@ -720,10 +812,8 @@ function tasks(v) {
   const tf = document.getElementById("taskForm");
   if (tf) tf.onsubmit = async (e) => {
     e.preventDefault(); const f = new FormData(e.target);
-    try {
-      await api("/api/tasks", { method:"POST", body:JSON.stringify(Object.fromEntries(f.entries())) });
-      toast("Task assigned & user notified"); await refreshState();
-    } catch (err) { toast(err.message); }
+    try { await api("/api/tasks", { method:"POST", body:JSON.stringify(Object.fromEntries(f.entries())) }); toast("Task assigned & user notified live"); await refreshState(); }
+    catch (err) { toast(err.message); }
   };
 
   document.getElementById("tasksTbl").onclick = async (e) => {
@@ -731,11 +821,8 @@ function tasks(v) {
     if (!b) return;
     const note = prompt(`Optional completion note for "${b.dataset.title}":`, "");
     if (note === null) return;
-    try {
-      await api(`/api/tasks/${b.dataset.id}/complete`, { method:"POST", body:JSON.stringify({ completion_note: note }) });
-      toast("Task marked completed! Row Lead & Admin notified.");
-      await refreshState();
-    } catch (err) { toast(err.message); }
+    try { await api(`/api/tasks/${b.dataset.id}/complete`, { method:"POST", body:JSON.stringify({ completion_note: note }) }); toast("Task completed! Row Lead & Admin notified."); await refreshState(); }
+    catch (err) { toast(err.message); }
   };
 }
 
