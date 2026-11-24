@@ -42,6 +42,33 @@ app.use("/api", (req, res, next) => {
 
 app.use(express.static(path.join(__dirname, "public")));
 
+// ================= IN-MEMORY SETTINGS CACHE =================
+let settingsCache = {
+  targets: SEED.targets,
+  weights: SEED.weights,
+  breaks: SEED.breaks,
+  security: SEED.security,
+  clock: SEED.clock
+};
+
+async function loadSettingsCache() {
+  try {
+    const { rows } = await pool.query("SELECT key, value FROM settings");
+    rows.forEach((r) => { settingsCache[r.key] = r.value; });
+  } catch {}
+}
+
+function getOrgTodayISO() {
+  const dstOn = Boolean(settingsCache.clock?.daylightSaving);
+  const offsetHours = dstOn ? -4 : -5;
+  return new Date(Date.now() + offsetHours * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+function getIdleMinutes() {
+  return Math.max(5, Number(settingsCache.security?.idleTimeoutMinutes) || 15);
+}
+
+// ================= SSE LIVE SYNC =================
 const sseClients = new Set();
 
 function broadcastSync(filterFn, payload) {
@@ -54,20 +81,10 @@ function broadcastSync(filterFn, payload) {
 }
 
 const loginAttempts = new Map();
+const lastSessionTouch = new Map();
 
 function getClientIp(req) {
   return String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
-}
-
-async function getOrgTodayISO() {
-  try {
-    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'clock'");
-    const dstOn = Boolean(rows[0]?.value?.daylightSaving);
-    const offsetHours = dstOn ? -4 : -5;
-    return new Date(Date.now() + offsetHours * 3600 * 1000).toISOString().slice(0, 10);
-  } catch {
-    return new Date(Date.now() - 5 * 3600 * 1000).toISOString().slice(0, 10);
-  }
 }
 
 function roleLabel(r) {
@@ -83,48 +100,35 @@ function validateStrongPassword(pw) {
   return null;
 }
 
-async function logAudit(actor, action, details, req) {
-  try {
-    await pool.query(
-      "INSERT INTO audit_logs (actor_id, actor_name, actor_role, action, details, ip_address) VALUES ($1,$2,$3,$4,$5,$6)",
-      [actor?.id || null, actor?.name || "System", actor?.role ? roleLabel(actor.role) : "", action, details, req ? getClientIp(req) : ""]
-    );
-  } catch {}
+function logAuditAsync(actor, action, details, ip = "") {
+  pool.query(
+    "INSERT INTO audit_logs (actor_id, actor_name, actor_role, action, details, ip_address) VALUES ($1,$2,$3,$4,$5,$6)",
+    [actor?.id || null, actor?.name || "System", actor?.role ? roleLabel(actor.role) : "", action, details, ip]
+  ).catch(() => {});
 }
 
-async function getIdleMinutes() {
-  try {
-    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'security'");
-    return Math.max(5, Number(rows[0]?.value?.idleTimeoutMinutes) || 15);
-  } catch {
-    return 15;
-  }
-}
-
+// Single atomic CTE query (1 round-trip instead of 5!)
 async function setSeatStatus(user, status, note = "") {
-  const shiftDate = await getOrgTodayISO();
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("UPDATE presence_logs SET ended_at = NOW() WHERE user_id = $1 AND ended_at IS NULL", [user.id]);
-    if (status !== "Offline") {
-      await client.query(
-        "INSERT INTO presence_logs (user_id, user_name, lead_name, shift_date, status, note) VALUES ($1,$2,$3,$4,$5,$6)",
-        [user.id, user.name, user.lead || "", shiftDate, status, note]
-      );
-    }
-    await client.query("UPDATE users SET seat_status = $1, seat_note = $2, seat_updated_at = NOW() WHERE id = $3", [status, note, user.id]);
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  const shiftDate = getOrgTodayISO();
+  await pool.query(
+    `WITH closed AS (
+       UPDATE presence_logs SET ended_at = NOW() WHERE user_id = $1 AND ended_at IS NULL
+     ),
+     inserted AS (
+       INSERT INTO presence_logs (user_id, user_name, lead_name, shift_date, status, note)
+       SELECT $1, $2, $3, $4, $5, $6
+       WHERE $5 <> 'Offline'
+     )
+     UPDATE users SET seat_status = $5, seat_note = $6, seat_updated_at = NOW() WHERE id = $1`,
+    [user.id, user.name, user.lead || "", shiftDate, status, note]
+  );
 }
 
 async function closeUserSession(sessionId, user, reason = "Logout") {
-  if (sessionId) await pool.query("UPDATE sessions SET revoked = true WHERE id = $1", [sessionId]);
+  if (sessionId) {
+    lastSessionTouch.delete(sessionId);
+    await pool.query("UPDATE sessions SET revoked = true WHERE id = $1", [sessionId]);
+  }
   if (user) {
     const activeSess = await pool.query("SELECT 1 FROM sessions WHERE user_id = $1 AND revoked = false AND expires_at > NOW() LIMIT 1", [user.id]);
     if (activeSess.rowCount === 0) {
@@ -139,7 +143,7 @@ async function closeUserSession(sessionId, user, reason = "Logout") {
 
 setInterval(async () => {
   try {
-    const idleMins = await getIdleMinutes();
+    const idleMins = getIdleMinutes();
     const { rows } = await pool.query(
       `SELECT s.id AS session_id, u.id, u.name, u.role, u.lead
        FROM sessions s JOIN users u ON u.id = s.user_id
@@ -148,39 +152,51 @@ setInterval(async () => {
     );
     for (const row of rows) {
       await closeUserSession(row.session_id, row, "Auto-Logoff (Idle)");
-      await logAudit(row, "AUTO_LOGOFF", "Session closed due to inactivity", null);
+      logAuditAsync(row, "AUTO_LOGOFF", "Session closed due to inactivity", "");
     }
   } catch {}
 }, 60000);
 
+// Fast 1-query Auth Middleware
 async function requireAuth(req, res, next) {
   const token = req.cookies.medva_token;
   if (!token) return res.status(401).json({ error: "Not authenticated" });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const sRes = await pool.query("SELECT * FROM sessions WHERE id = $1", [decoded.sid]);
-    const sess = sRes.rows[0];
-    if (!sess || sess.revoked || new Date(sess.expires_at) < new Date()) {
+    const { rows } = await pool.query(
+      `SELECT s.id AS sid, s.last_activity_at, s.expires_at, s.revoked,
+              u.id, u.first_name, u.last_name, u.name, u.date_of_joining, u.pseudo_name, u.email,
+              u.designation, u.username, u.role, u.lead, u.status, u.seat_status, u.seat_note, u.seat_updated_at
+       FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.id = $1`,
+      [decoded.sid]
+    );
+    const row = rows[0];
+    if (!row || row.revoked || new Date(row.expires_at) < new Date()) {
       return res.status(401).json({ error: "Session expired. Please sign in again." });
     }
-    const idleMins = await getIdleMinutes();
-    const idleMs = Date.now() - new Date(sess.last_activity_at).getTime();
-    const { rows } = await pool.query(
-      "SELECT id, first_name, last_name, name, date_of_joining, pseudo_name, email, designation, username, role, lead, status, seat_status, seat_note, seat_updated_at FROM users WHERE id = $1",
-      [decoded.id]
-    );
-    const user = rows[0];
-    if (!user || user.status !== "Active") return res.status(401).json({ error: "Account inactive or missing" });
+    if (row.status !== "Active") return res.status(401).json({ error: "Account inactive or missing" });
+
+    const idleMins = getIdleMinutes();
+    const idleMs = Date.now() - new Date(row.last_activity_at).getTime();
     if (idleMs > idleMins * 60 * 1000) {
-      await closeUserSession(sess.id, user, "Auto-Logoff (Idle)");
-      await logAudit(user, "AUTO_LOGOFF", `Timed out after ${idleMins} minutes of inactivity`, req);
+      await closeUserSession(row.sid, row, "Auto-Logoff (Idle)");
+      logAuditAsync(row, "AUTO_LOGOFF", `Timed out after ${idleMins} minutes of inactivity`, getClientIp(req));
       return res.status(401).json({ error: "Logged out automatically due to inactivity." });
     }
+
+    // Throttle non-blocking session touch to once every 30s
     if (req.path !== "/events" && req.query.bg !== "1") {
-      await pool.query("UPDATE sessions SET last_activity_at = NOW() WHERE id = $1", [sess.id]);
+      const now = Date.now();
+      if (now - (lastSessionTouch.get(row.sid) || 0) > 30000) {
+        lastSessionTouch.set(row.sid, now);
+        pool.query("UPDATE sessions SET last_activity_at = NOW() WHERE id = $1", [row.sid]).catch(() => {});
+      }
     }
-    req.user = user;
-    req.sessionId = sess.id;
+
+    req.user = row;
+    req.sessionId = row.sid;
     next();
   } catch {
     return res.status(401).json({ error: "Session expired" });
@@ -232,7 +248,7 @@ app.post("/api/auth/login", async (req, res) => {
     rec.count += 1;
     if (rec.count >= 5) { rec.lockedUntil = Date.now() + 15 * 60 * 1000; rec.count = 0; }
     loginAttempts.set(key, rec);
-    await logAudit({ id: user?.id || null, name: username, role: selectedRole }, "LOGIN_FAILED", `Failed login (${selectedRole})`, req);
+    logAuditAsync({ id: user?.id || null, name: username, role: selectedRole }, "LOGIN_FAILED", `Failed login (${selectedRole})`, ip);
     if (user && user.status !== "Active") return res.status(403).json({ error: "Account is inactive. Contact Admin." });
     if (user && validPw && user.role !== selectedRole) return res.status(403).json({ error: `Account is registered as ${roleLabel(user.role)}, not ${roleLabel(selectedRole)}.` });
     return res.status(401).json({ error: "Invalid username or password" });
@@ -240,73 +256,81 @@ app.post("/api/auth/login", async (req, res) => {
 
   loginAttempts.delete(key);
   const sid = crypto.randomBytes(24).toString("hex");
-  await pool.query("INSERT INTO sessions (id, user_id, ip_address, expires_at) VALUES ($1, $2, $3, NOW() + interval '12 hours')", [sid, user.id, ip]);
-  await pool.query("UPDATE users SET last_login_at = NOW() WHERE id = $1", [user.id]);
-  await setSeatStatus(user, "Available", "Signed in");
-  await logAudit(user, "LOGIN_SUCCESS", `Signed in as ${roleLabel(user.role)}`, req);
+  const shiftDate = getOrgTodayISO();
 
-  broadcastSync(
-    (u) => u.role === "super_admin" || (u.role === "row_lead" && (u.lead || u.name) === (user.lead || "")),
-    { type: "presence_updated", actorId: user.id, toast: `${user.name} logged in (Available)` }
-  );
+  await Promise.all([
+    pool.query("INSERT INTO sessions (id, user_id, ip_address, expires_at) VALUES ($1, $2, $3, NOW() + interval '12 hours')", [sid, user.id, ip]),
+    pool.query("UPDATE users SET last_login_at = NOW(), seat_status = 'Available', seat_note = 'Signed in', seat_updated_at = NOW() WHERE id = $1", [user.id]),
+    pool.query(
+      `WITH closed AS (UPDATE presence_logs SET ended_at = NOW() WHERE user_id = $1 AND ended_at IS NULL)
+       INSERT INTO presence_logs (user_id, user_name, lead_name, shift_date, status, note) VALUES ($1,$2,$3,$4,'Available','Signed in')`,
+      [user.id, user.name, user.lead || "", shiftDate]
+    )
+  ]);
 
   const token = jwt.sign({ id: user.id, sid, role: user.role }, JWT_SECRET, { expiresIn: "12h" });
   res.cookie("medva_token", token, { httpOnly: true, sameSite: "lax", secure: isProd, maxAge: 12 * 60 * 60 * 1000 });
   res.json({ ok: true });
+
+  // Non-blocking audit & broadcast
+  logAuditAsync(user, "LOGIN_SUCCESS", `Signed in as ${roleLabel(user.role)}`, ip);
+  broadcastSync(
+    (u) => u.role === "super_admin" || (u.role === "row_lead" && (u.lead || u.name) === (user.lead || "")),
+    { type: "presence_updated", actorId: user.id, toast: `${user.name} logged in (Available)` }
+  );
 });
 
 app.post("/api/auth/logout", async (req, res) => {
   const token = req.cookies.medva_token;
+  res.clearCookie("medva_token");
+  res.json({ ok: true });
   if (token) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
       const { rows } = await pool.query("SELECT id, name, role, lead FROM users WHERE id = $1", [decoded.id]);
       const reason = req.body?.reason === "idle" ? "Auto-Logoff (Idle)" : "Logged Out";
       await closeUserSession(decoded.sid, rows[0], reason);
-      if (rows[0]) await logAudit(rows[0], req.body?.reason === "idle" ? "AUTO_LOGOFF" : "LOGOUT", reason, req);
+      if (rows[0]) logAuditAsync(rows[0], req.body?.reason === "idle" ? "AUTO_LOGOFF" : "LOGOUT", reason, getClientIp(req));
     } catch {}
   }
-  res.clearCookie("medva_token");
-  res.json({ ok: true });
 });
 
 app.get("/api/bootstrap", requireAuth, async (req, res) => {
   const role = req.user.role;
-  const orgToday = await getOrgTodayISO();
+  const orgToday = getOrgTodayISO();
 
-  const [leadsRes, practicesRes, settingsRes, notifRes] = await Promise.all([
+  const baseQueries = [
     pool.query("SELECT name FROM leads ORDER BY name"),
     pool.query("SELECT name FROM practices ORDER BY name"),
-    pool.query("SELECT key, value FROM settings"),
     pool.query("SELECT * FROM notifications WHERE recipient_id = $1 ORDER BY created_at DESC LIMIT 40", [req.user.id])
-  ]);
+  ];
 
-  const settings = {};
-  settingsRes.rows.forEach((r) => (settings[r.key] = r.value));
-
-  let usersRes, assignRes, signRes, activeSessRes, auditRes;
+  let roleQueries;
   if (role === "super_admin") {
-    [usersRes, assignRes, signRes, activeSessRes, auditRes] = await Promise.all([
+    roleQueries = [
       pool.query("SELECT id, first_name, last_name, name, date_of_joining, pseudo_name, email, designation, username, role, lead, status, seat_status, seat_note, seat_updated_at, last_login_at, (password_hash IS NOT NULL) AS has_password FROM users ORDER BY role, name"),
       pool.query('SELECT user_name AS "user", practice_name AS practice FROM assignments ORDER BY user_name'),
       pool.query('SELECT date, user_name AS "user", lead_name AS lead, vobs, calls, scheduling, payments::float, extra, notes, updated_by, updated_by_role, updated_at FROM signoffs ORDER BY date DESC'),
       pool.query("SELECT DISTINCT user_id FROM sessions WHERE revoked = false AND expires_at > NOW()"),
       pool.query("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200")
-    ]);
+    ];
   } else if (role === "row_lead") {
     const teamLead = req.user.lead || req.user.name;
-    [usersRes, assignRes, signRes] = await Promise.all([
+    roleQueries = [
       pool.query("SELECT id, first_name, last_name, name, date_of_joining, pseudo_name, email, designation, username, role, lead, status, seat_status, seat_note, seat_updated_at FROM users WHERE role = 'user' AND lead = $1 ORDER BY name", [teamLead]),
       pool.query('SELECT a.user_name AS "user", a.practice_name AS practice FROM assignments a JOIN users u ON a.user_name = u.name WHERE u.lead = $1', [teamLead]),
       pool.query('SELECT date, user_name AS "user", lead_name AS lead, vobs, calls, scheduling, payments::float, extra, notes, updated_by, updated_by_role, updated_at FROM signoffs WHERE lead_name = $1 ORDER BY date DESC', [teamLead])
-    ]);
+    ];
   } else {
-    [usersRes, assignRes, signRes] = await Promise.all([
+    roleQueries = [
       pool.query("SELECT id, first_name, last_name, name, date_of_joining, pseudo_name, email, designation, username, role, lead, status, seat_status, seat_note, seat_updated_at FROM users WHERE id = $1", [req.user.id]),
       pool.query('SELECT user_name AS "user", practice_name AS practice FROM assignments WHERE user_name = $1', [req.user.name]),
       pool.query('SELECT date, user_name AS "user", lead_name AS lead, vobs, calls, scheduling, payments::float, extra, notes, updated_by, updated_by_role, updated_at FROM signoffs WHERE user_name = $1 ORDER BY date DESC', [req.user.name])
-    ]);
+    ];
   }
+
+  const results = await Promise.all([...baseQueries, ...roleQueries]);
+  const [leadsRes, practicesRes, notifRes, usersRes, assignRes, signRes, activeSessRes, auditRes] = results;
 
   res.json({
     currentUser: req.user,
@@ -319,11 +343,11 @@ app.get("/api/bootstrap", requireAuth, async (req, res) => {
     leads: leadsRes.rows.map((r) => r.name),
     signoffs: signRes.rows,
     auditLogs: auditRes ? auditRes.rows : [],
-    breaks: settings.breaks || SEED.breaks,
-    security: settings.security || SEED.security,
-    clock: settings.clock || SEED.clock,
-    targets: role === "super_admin" ? (settings.targets || SEED.targets) : null,
-    weights: role === "super_admin" ? (settings.weights || SEED.weights) : null
+    breaks: settingsCache.breaks,
+    security: settingsCache.security,
+    clock: settingsCache.clock,
+    targets: role === "super_admin" ? settingsCache.targets : null,
+    weights: role === "super_admin" ? settingsCache.weights : null
   });
 });
 
@@ -332,6 +356,7 @@ app.post("/api/notifications/read-all", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Fast Seat Status Endpoint (~1 DB query before responding!)
 app.post("/api/presence", requireAuth, async (req, res) => {
   const allowed = ["Available", "Short Break", "Away"];
   const status = String(req.body.status || "");
@@ -339,28 +364,27 @@ app.post("/api/presence", requireAuth, async (req, res) => {
   if (!allowed.includes(status)) return res.status(400).json({ error: "Invalid seat status" });
 
   await setSeatStatus(req.user, status, note);
-  await logAudit(req.user, "SEAT_STATUS", `Changed seat status to ${status}${note ? ` (${note})` : ""}`, req);
+  res.json({ ok: true, seat_status: status, seat_note: note });
+
+  // Background audit, notifications & SSE
+  const ip = getClientIp(req);
+  logAuditAsync(req.user, "SEAT_STATUS", `Changed seat status to ${status}${note ? ` (${note})` : ""}`, ip);
 
   if (status !== "Available") {
-    const recipients = new Set();
-    const admins = await pool.query("SELECT id FROM users WHERE role = 'super_admin' AND status = 'Active'");
-    admins.rows.forEach((a) => recipients.add(a.id));
-    if (req.user.lead) {
-      const leads = await pool.query("SELECT id FROM users WHERE role = 'row_lead' AND status = 'Active' AND (lead = $1 OR name = $1)", [req.user.lead]);
-      leads.rows.forEach((l) => recipients.add(l.id));
-    }
-    for (const recId of recipients) {
-      if (recId === req.user.id) continue;
-      await pool.query("INSERT INTO notifications (recipient_id, type, title, message) VALUES ($1, 'presence', $2, $3)",
-        [recId, `${req.user.name} is ${status}`, `${req.user.name} switched seat status to ${status}${note ? ` (${note})` : ""}.`]);
-    }
+    pool.query(
+      `INSERT INTO notifications (recipient_id, type, title, message)
+       SELECT id, 'presence', $1, $2
+       FROM users
+       WHERE status = 'Active' AND id <> $3
+         AND (role = 'super_admin' OR (role = 'row_lead' AND (lead = $4 OR name = $4)))`,
+      [`${req.user.name} is ${status}`, `${req.user.name} switched seat status to ${status}${note ? ` (${note})` : ""}.`, req.user.id, req.user.lead || ""]
+    ).catch(() => {});
   }
 
   broadcastSync(
     (u) => u.role === "super_admin" || (u.role === "row_lead" && (u.lead || u.name) === (req.user.lead || "")) || u.id === req.user.id,
     { type: "presence_updated", actorId: req.user.id, toast: `${req.user.name} is now ${status}` }
   );
-  res.json({ ok: true });
 });
 
 app.get("/api/leaderboard", requireAuth, requireRole("super_admin", "row_lead"), async (req, res) => {
@@ -413,7 +437,7 @@ app.post("/api/users", requireAuth, requireRole("super_admin"), async (req, res)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, name`,
       [first_name, last_name, name, date_of_joining, pseudo_name, email, designation, username, hash, role, effectiveLead, status]
     );
-    await logAudit(req.user, "USER_CREATE", `Created ${roleLabel(role)} account: ${name}`, req);
+    logAuditAsync(req.user, "USER_CREATE", `Created ${roleLabel(role)} account: ${name}`, getClientIp(req));
     broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
     res.json({ user: rows[0] });
   } catch (err) {
@@ -470,7 +494,7 @@ app.put("/api/users/:id", requireAuth, requireRole("super_admin"), async (req, r
     if (role === "row_lead" && lead) await client.query("INSERT INTO leads (name) VALUES ($1) ON CONFLICT DO NOTHING", [lead]);
     if (status === "Inactive" || newPassword) await client.query("UPDATE sessions SET revoked = true WHERE user_id = $1", [id]);
     await client.query("COMMIT");
-    await logAudit(req.user, "USER_UPDATE", `Updated account ${name}${newPassword ? " (password changed)" : ""}`, req);
+    logAuditAsync(req.user, "USER_UPDATE", `Updated account ${name}${newPassword ? " (password changed)" : ""}`, getClientIp(req));
     broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
     res.json({ ok: true });
   } catch (err) {
@@ -487,12 +511,14 @@ app.delete("/api/users/:id", requireAuth, requireRole("super_admin"), async (req
   if (id === req.user.id) return res.status(400).json({ error: "Cannot delete your own Admin account" });
   const { rows } = await pool.query("DELETE FROM users WHERE id = $1 RETURNING name", [id]);
   if (rows[0]) {
-    await pool.query("DELETE FROM assignments WHERE user_name = $1", [rows[0].name]);
-    await pool.query("DELETE FROM signoffs WHERE user_name = $1", [rows[0].name]);
-    await pool.query("DELETE FROM sessions WHERE user_id = $1", [id]);
-    await pool.query("DELETE FROM presence_logs WHERE user_id = $1", [id]);
-    await pool.query("DELETE FROM notifications WHERE recipient_id = $1", [id]);
-    await logAudit(req.user, "USER_DELETE", `Deleted account: ${rows[0].name}`, req);
+    await Promise.all([
+      pool.query("DELETE FROM assignments WHERE user_name = $1", [rows[0].name]),
+      pool.query("DELETE FROM signoffs WHERE user_name = $1", [rows[0].name]),
+      pool.query("DELETE FROM sessions WHERE user_id = $1", [id]),
+      pool.query("DELETE FROM presence_logs WHERE user_id = $1", [id]),
+      pool.query("DELETE FROM notifications WHERE recipient_id = $1", [id])
+    ]);
+    logAuditAsync(req.user, "USER_DELETE", `Deleted account: ${rows[0].name}`, getClientIp(req));
   }
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
@@ -501,14 +527,14 @@ app.delete("/api/users/:id", requireAuth, requireRole("super_admin"), async (req
 app.post("/api/assignments", requireAuth, requireRole("super_admin"), async (req, res) => {
   if (!req.body.user || !req.body.practice) return res.status(400).json({ error: "User and practice required" });
   await pool.query("INSERT INTO assignments (user_name, practice_name) VALUES ($1, $2) ON CONFLICT DO NOTHING", [req.body.user, req.body.practice]);
-  await logAudit(req.user, "ASSIGNMENT_ADD", `${req.body.user} <-> ${req.body.practice}`, req);
+  logAuditAsync(req.user, "ASSIGNMENT_ADD", `${req.body.user} <-> ${req.body.practice}`, getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.delete("/api/assignments", requireAuth, requireRole("super_admin"), async (req, res) => {
   await pool.query("DELETE FROM assignments WHERE user_name = $1 AND practice_name = $2", [req.body.user, req.body.practice]);
-  await logAudit(req.user, "ASSIGNMENT_REMOVE", `${req.body.user} <-> ${req.body.practice}`, req);
+  logAuditAsync(req.user, "ASSIGNMENT_REMOVE", `${req.body.user} <-> ${req.body.practice}`, getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
@@ -517,15 +543,17 @@ app.post("/api/practices", requireAuth, requireRole("super_admin"), async (req, 
   const practice = String(req.body.practice || "").trim();
   if (!practice) return res.status(400).json({ error: "Practice name required" });
   await pool.query("INSERT INTO practices (name) VALUES ($1) ON CONFLICT DO NOTHING", [practice]);
-  await logAudit(req.user, "PRACTICE_ADD", practice, req);
+  logAuditAsync(req.user, "PRACTICE_ADD", practice, getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.delete("/api/practices/:name", requireAuth, requireRole("super_admin"), async (req, res) => {
-  await pool.query("DELETE FROM practices WHERE name = $1", [req.params.name]);
-  await pool.query("DELETE FROM assignments WHERE practice_name = $1", [req.params.name]);
-  await logAudit(req.user, "PRACTICE_DELETE", req.params.name, req);
+  await Promise.all([
+    pool.query("DELETE FROM practices WHERE name = $1", [req.params.name]),
+    pool.query("DELETE FROM assignments WHERE practice_name = $1", [req.params.name])
+  ]);
+  logAuditAsync(req.user, "PRACTICE_DELETE", req.params.name, getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
@@ -534,7 +562,7 @@ app.post("/api/leads", requireAuth, requireRole("super_admin"), async (req, res)
   const lead = String(req.body.lead || "").trim();
   if (!lead) return res.status(400).json({ error: "Row lead name required" });
   await pool.query("INSERT INTO leads (name) VALUES ($1) ON CONFLICT DO NOTHING", [lead]);
-  await logAudit(req.user, "LEAD_ADD", lead, req);
+  logAuditAsync(req.user, "LEAD_ADD", lead, getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
@@ -543,21 +571,36 @@ app.delete("/api/leads/:name", requireAuth, requireRole("super_admin"), async (r
   const check = await pool.query("SELECT 1 FROM users WHERE lead = $1 LIMIT 1", [req.params.name]);
   if (check.rowCount > 0) return res.status(400).json({ error: "Reassign users before deleting this Row Lead" });
   await pool.query("DELETE FROM leads WHERE name = $1", [req.params.name]);
-  await logAudit(req.user, "LEAD_DELETE", req.params.name, req);
+  logAuditAsync(req.user, "LEAD_DELETE", req.params.name, getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "" });
   res.json({ ok: true });
 });
 
 app.put("/api/settings", requireAuth, requireRole("super_admin"), async (req, res) => {
-  if (req.body.targets) await pool.query("INSERT INTO settings (key, value) VALUES ('targets', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.targets)]);
-  if (req.body.weights) await pool.query("INSERT INTO settings (key, value) VALUES ('weights', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.weights)]);
-  if (req.body.breaks) await pool.query("INSERT INTO settings (key, value) VALUES ('breaks', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.breaks)]);
-  if (req.body.security) await pool.query("INSERT INTO settings (key, value) VALUES ('security', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.security)]);
+  const ops = [];
+  if (req.body.targets) {
+    settingsCache.targets = req.body.targets;
+    ops.push(pool.query("INSERT INTO settings (key, value) VALUES ('targets', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.targets)]));
+  }
+  if (req.body.weights) {
+    settingsCache.weights = req.body.weights;
+    ops.push(pool.query("INSERT INTO settings (key, value) VALUES ('weights', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.weights)]));
+  }
+  if (req.body.breaks) {
+    settingsCache.breaks = req.body.breaks;
+    ops.push(pool.query("INSERT INTO settings (key, value) VALUES ('breaks', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.breaks)]));
+  }
+  if (req.body.security) {
+    settingsCache.security = req.body.security;
+    ops.push(pool.query("INSERT INTO settings (key, value) VALUES ('security', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(req.body.security)]));
+  }
   if (req.body.clock) {
     const cleanClock = { daylightSaving: Boolean(req.body.clock.daylightSaving) };
-    await pool.query("INSERT INTO settings (key, value) VALUES ('clock', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(cleanClock)]);
+    settingsCache.clock = cleanClock;
+    ops.push(pool.query("INSERT INTO settings (key, value) VALUES ('clock', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(cleanClock)]));
   }
-  await logAudit(req.user, "SETTINGS_UPDATE", "Updated scoring, break schedule, DST clock, or security settings", req);
+  await Promise.all(ops);
+  logAuditAsync(req.user, "SETTINGS_UPDATE", "Updated scoring, break schedule, DST clock, or security settings", getClientIp(req));
   broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "Settings & Clock updated by Admin" });
   res.json({ ok: true });
 });
@@ -589,44 +632,43 @@ app.post("/api/signoffs", requireAuth, async (req, res) => {
   const updaterName = req.user.name;
   const updaterRole = roleLabel(req.user.role);
 
-  await pool.query(
-    `INSERT INTO signoffs (date, user_name, lead_name, vobs, calls, scheduling, payments, extra, notes, updated_by, updated_by_role, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-     ON CONFLICT (date, user_name) DO UPDATE SET
-       lead_name=EXCLUDED.lead_name, vobs=EXCLUDED.vobs, calls=EXCLUDED.calls, scheduling=EXCLUDED.scheduling,
-       payments=EXCLUDED.payments, extra=EXCLUDED.extra, notes=EXCLUDED.notes,
-       updated_by=EXCLUDED.updated_by, updated_by_role=EXCLUDED.updated_by_role, updated_at=NOW()`,
-    [date, target.name, target.lead || "", vobs, calls, scheduling, payments, extra, notes, updaterName, updaterRole]
-  );
+  await Promise.all([
+    pool.query(
+      `INSERT INTO signoffs (date, user_name, lead_name, vobs, calls, scheduling, payments, extra, notes, updated_by, updated_by_role, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+       ON CONFLICT (date, user_name) DO UPDATE SET
+         lead_name=EXCLUDED.lead_name, vobs=EXCLUDED.vobs, calls=EXCLUDED.calls, scheduling=EXCLUDED.scheduling,
+         payments=EXCLUDED.payments, extra=EXCLUDED.extra, notes=EXCLUDED.notes,
+         updated_by=EXCLUDED.updated_by, updated_by_role=EXCLUDED.updated_by_role, updated_at=NOW()`,
+      [date, target.name, target.lead || "", vobs, calls, scheduling, payments, extra, notes, updaterName, updaterRole]
+    ),
+    pool.query(
+      `INSERT INTO signoff_logs (signoff_date, user_name, updated_by, updated_by_role, vobs, calls, scheduling, payments, extra, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [date, target.name, updaterName, updaterRole, vobs, calls, scheduling, payments, extra, notes]
+    )
+  ]);
 
-  await pool.query(
-    `INSERT INTO signoff_logs (signoff_date, user_name, updated_by, updated_by_role, vobs, calls, scheduling, payments, extra, notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    [date, target.name, updaterName, updaterRole, vobs, calls, scheduling, payments, extra, notes]
-  );
-  await logAudit(req.user, "SIGNOFF_SAVE", `Saved sign-off for ${target.name} on ${date}`, req);
+  res.json({ ok: true });
 
-  const recipients = new Set();
-  const admins = await pool.query("SELECT id FROM users WHERE role = 'super_admin' AND status = 'Active'");
-  admins.rows.forEach((a) => recipients.add(a.id));
-  if (target.lead) {
-    const leads = await pool.query("SELECT id FROM users WHERE role = 'row_lead' AND status = 'Active' AND (lead = $1 OR name = $1)", [target.lead]);
-    leads.rows.forEach((l) => recipients.add(l.id));
-  }
-  recipients.add(target.id);
+  // Background audit, notifications & SSE
+  logAuditAsync(req.user, "SIGNOFF_SAVE", `Saved sign-off for ${target.name} on ${date}`, getClientIp(req));
 
   const notifTitle = `Sign-Off Updated: ${target.name} (${date})`;
   const notifMsg = `${updaterName} (${updaterRole}) updated sign-off for ${target.name} on ${date} — VOBs: ${vobs}, Calls: ${calls}, Sched: ${scheduling}, Payments: $${payments.toFixed(2)}, Extra: ${extra}.`;
-  for (const recId of recipients) {
-    if (recId === req.user.id) continue;
-    await pool.query("INSERT INTO notifications (recipient_id, type, title, message) VALUES ($1, 'signoff_updated', $2, $3)", [recId, notifTitle, notifMsg]);
-  }
+  pool.query(
+    `INSERT INTO notifications (recipient_id, type, title, message)
+     SELECT id, 'signoff_updated', $1, $2
+     FROM users
+     WHERE status = 'Active' AND id <> $3
+       AND (id = $4 OR role = 'super_admin' OR (role = 'row_lead' AND (lead = $5 OR name = $5)))`,
+    [notifTitle, notifMsg, req.user.id, target.id, target.lead || ""]
+  ).catch(() => {});
 
   broadcastSync(
     (u) => u.role === "super_admin" || (u.role === "row_lead" && (u.lead || u.name) === (target.lead || "")) || u.id === target.id,
     { type: "signoff_updated", actorId: req.user.id, toast: `${updaterName} updated sign-off for ${target.name} (${date})` }
   );
-  res.json({ ok: true });
 });
 
 app.get("/api/signoffs/logs", requireAuth, async (req, res) => {
@@ -648,10 +690,9 @@ async function buildClockSummary(from, to, leadFilter = "", userFilter = "") {
   if (userFilter) { uParams.push(userFilter); uSql += ` AND name = $${uParams.length}`; }
   uSql += " ORDER BY role, name";
 
-  const [uRes, pRes, bRes] = await Promise.all([
+  const [uRes, pRes] = await Promise.all([
     pool.query(uSql, uParams),
-    pool.query("SELECT * FROM presence_logs WHERE shift_date >= $1 AND shift_date <= $2", [from, to]),
-    pool.query("SELECT value FROM settings WHERE key = 'breaks'")
+    pool.query("SELECT * FROM presence_logs WHERE shift_date >= $1 AND shift_date <= $2", [from, to])
   ]);
 
   const now = Date.now();
@@ -675,13 +716,13 @@ async function buildClockSummary(from, to, leadFilter = "", userFilter = "") {
       break_count: breakCount, away_count: awayCount
     };
   });
-  return { rows, breaks: bRes.rows[0]?.value || SEED.breaks };
+  return { rows, breaks: settingsCache.breaks };
 }
 
 function fmtMins(m) { return `${Math.floor(m / 60)}h ${m % 60}m`; }
 
 app.get("/api/reports/clock-summary", requireAuth, requireRole("super_admin"), async (req, res) => {
-  const today = await getOrgTodayISO();
+  const today = getOrgTodayISO();
   const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from) ? req.query.from : today;
   const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to) ? req.query.to : today;
   const result = await buildClockSummary(from, to, req.query.lead || "", req.query.user || "");
@@ -690,11 +731,11 @@ app.get("/api/reports/clock-summary", requireAuth, requireRole("super_admin"), a
 
 app.get("/api/reports/clock-summary/export", requireAuth, requireRole("super_admin"), async (req, res) => {
   const format = req.query.format === "pdf" ? "pdf" : "xlsx";
-  const today = await getOrgTodayISO();
+  const today = getOrgTodayISO();
   const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from) ? req.query.from : today;
   const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to) ? req.query.to : today;
   const { rows } = await buildClockSummary(from, to, req.query.lead || "", req.query.user || "");
-  await logAudit(req.user, "REPORT_EXPORT", `Exported Clock Summary (${format.toUpperCase()}) for ${from} to ${to}`, req);
+  logAuditAsync(req.user, "REPORT_EXPORT", `Exported Clock Summary (${format.toUpperCase()}) for ${from} to ${to}`, getClientIp(req));
 
   const headers = ["Employee", "Role", "Row Lead", "Live Status", "On Seat", "Short Break", "Away", "Total Out of Seat", "Breaks Taken", "Away Count"];
   const data = rows.map((r) => [
@@ -793,7 +834,7 @@ app.get("/api/reports/signoffs/export", requireAuth, async (req, res) => {
     return qMatch && (status === "All" || st === status);
   });
 
-  await logAudit(req.user, "REPORT_EXPORT", `Exported Sign-Off Report (${format.toUpperCase()}, ${filtered.length} rows)`, req);
+  logAuditAsync(req.user, "REPORT_EXPORT", `Exported Sign-Off Report (${format.toUpperCase()}, ${filtered.length} rows)`, getClientIp(req));
 
   const headers = ["Date", "Employee", "Row Lead", "VOBs", "Calls", "Sched.", "Payments", "Extra", "Status", "Updated By", "Notes"];
   const data = filtered.map((s) => {
@@ -809,7 +850,7 @@ app.get("/api/reports/signoffs/export", requireAuth, async (req, res) => {
 
 app.get("/api/reports/bonus/export", requireAuth, requireRole("super_admin"), async (req, res) => {
   const format = req.query.format === "pdf" ? "pdf" : "xlsx";
-  const today = await getOrgTodayISO();
+  const today = getOrgTodayISO();
   const month = String(req.query.month || today.slice(0, 7)).slice(0, 7);
   if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: "Invalid month" });
 
@@ -818,17 +859,14 @@ app.get("/api/reports/bonus/export", requireAuth, requireRole("super_admin"), as
   let wd = 0;
   for (let d = 1; d <= lastDay; d++) { const dow = new Date(y, m - 1, d).getDay(); if (dow !== 0 && dow !== 6) wd++; }
 
-  const [uRes, aRes, sRes, setRes] = await Promise.all([
+  const [uRes, aRes, sRes] = await Promise.all([
     pool.query("SELECT name, lead FROM users WHERE role = 'user' AND status = 'Active' ORDER BY name"),
     pool.query("SELECT user_name, COUNT(*)::int AS c FROM assignments GROUP BY user_name"),
-    pool.query("SELECT * FROM signoffs WHERE date LIKE $1", [`${month}-%`]),
-    pool.query("SELECT key, value FROM settings")
+    pool.query("SELECT * FROM signoffs WHERE date LIKE $1", [`${month}-%`])
   ]);
 
-  const settings = {};
-  setRes.rows.forEach((r) => (settings[r.key] = r.value));
-  const t = settings.targets || SEED.targets;
-  const w = settings.weights || SEED.weights;
+  const t = settingsCache.targets;
+  const w = settingsCache.weights;
   const pMap = {};
   aRes.rows.forEach((r) => (pMap[r.user_name] = r.c));
 
@@ -857,7 +895,7 @@ app.get("/api/reports/bonus/export", requireAuth, requireRole("super_admin"), as
     return { user: u.name, lead: u.lead, practices: pMap[u.name] || 0, days, act, score, rating };
   }).sort((a, b) => b.score - a.score);
 
-  await logAudit(req.user, "REPORT_EXPORT", `Exported Monthly Bonus (${format.toUpperCase()}) for ${month}`, req);
+  logAuditAsync(req.user, "REPORT_EXPORT", `Exported Monthly Bonus (${format.toUpperCase()}) for ${month}`, getClientIp(req));
 
   const headers = ["Rank", "Employee", "Row Lead", "Practices", "Days", "VOBs", "Calls", "Sched.", "Payments", "Extra", "Score / 10", "Rating"];
   const data = scores.map((s, i) => [`#${i + 1}`, s.user, s.lead, s.practices, s.days, s.act.vobs, s.act.calls, s.act.scheduling, `$${s.act.payments.toFixed(2)}`, s.act.extra, s.score.toFixed(1), s.rating]);
@@ -890,20 +928,11 @@ app.post("/api/backup/restore", requireAuth, requireRole("super_admin"), async (
         `INSERT INTO users (first_name, last_name, name, date_of_joining, pseudo_name, email, designation, username, role, lead, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT (name) DO UPDATE SET
-           first_name = EXCLUDED.first_name,
-           last_name = EXCLUDED.last_name,
-           pseudo_name = EXCLUDED.pseudo_name,
-           email = EXCLUDED.email,
-           designation = EXCLUDED.designation,
+           first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name,
+           pseudo_name = EXCLUDED.pseudo_name, email = EXCLUDED.email, designation = EXCLUDED.designation,
            username = COALESCE(EXCLUDED.username, users.username),
-           role = EXCLUDED.role,
-           lead = EXCLUDED.lead,
-           status = EXCLUDED.status`,
-        [
-          u.first_name || first, u.last_name || last, u.name, u.date_of_joining || "",
-          u.pseudo_name || "", u.email || "", u.designation || "Medical Virtual Assistant",
-          u.username || null, u.role || "user", u.lead || "", u.status || "Active"
-        ]
+           role = EXCLUDED.role, lead = EXCLUDED.lead, status = EXCLUDED.status`,
+        [u.first_name || first, u.last_name || last, u.name, u.date_of_joining || "", u.pseudo_name || "", u.email || "", u.designation || "Medical Virtual Assistant", u.username || null, u.role || "user", u.lead || "", u.status || "Active"]
       );
     }
 
@@ -917,12 +946,12 @@ app.post("/api/backup/restore", requireAuth, requireRole("super_admin"), async (
         [s.date, s.user, s.lead || "", parseInt(s.vobs, 10) || 0, parseInt(s.calls, 10) || 0, parseInt(s.scheduling, 10) || 0, Number(s.payments) || 0, parseInt(s.extra, 10) || 0, s.notes || "", s.updated_by || req.user.name, s.updated_by_role || "Admin"]
       );
     }
-    if (b.targets) await client.query("INSERT INTO settings (key, value) VALUES ('targets', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.targets)]);
-    if (b.weights) await client.query("INSERT INTO settings (key, value) VALUES ('weights', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.weights)]);
-    if (b.breaks) await client.query("INSERT INTO settings (key, value) VALUES ('breaks', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.breaks)]);
-    if (b.clock) await client.query("INSERT INTO settings (key, value) VALUES ('clock', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.clock)]);
+    if (b.targets) { settingsCache.targets = b.targets; await client.query("INSERT INTO settings (key, value) VALUES ('targets', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.targets)]); }
+    if (b.weights) { settingsCache.weights = b.weights; await client.query("INSERT INTO settings (key, value) VALUES ('weights', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.weights)]); }
+    if (b.breaks) { settingsCache.breaks = b.breaks; await client.query("INSERT INTO settings (key, value) VALUES ('breaks', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.breaks)]); }
+    if (b.clock) { settingsCache.clock = b.clock; await client.query("INSERT INTO settings (key, value) VALUES ('clock', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [JSON.stringify(b.clock)]); }
     await client.query("COMMIT");
-    await logAudit(req.user, "BACKUP_RESTORE", "Restored database snapshot", req);
+    logAuditAsync(req.user, "BACKUP_RESTORE", "Restored database snapshot", getClientIp(req));
     broadcastSync(null, { type: "data_updated", actorId: req.user.id, toast: "Database restored by Admin" });
     res.json({ ok: true });
   } catch (err) {
@@ -934,5 +963,6 @@ app.post("/api/backup/restore", requireAuth, requireRole("super_admin"), async (
 });
 
 initDB()
+  .then(() => loadSettingsCache())
   .then(() => app.listen(PORT, () => console.log(`RhinoMDs Medical VA Portal running on port ${PORT}`)))
   .catch((err) => { console.error("Database initialization error:", err); process.exit(1); });
