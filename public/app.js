@@ -433,7 +433,7 @@ function renderAppShell() {
     if (b) setPage(b.dataset.page);
   });
 
-  document.getElementById("seatBtns").addEventListener("click", async (e) => {
+document.getElementById("seatBtns").addEventListener("click", async (e) => {
     const b = e.target.closest("button[data-status]");
     if (!b) return;
     const status = b.dataset.status;
@@ -445,8 +445,18 @@ function renderAppShell() {
     }
     try {
       await api("/api/presence", { method: "POST", body: JSON.stringify({ status, note }) });
+      state.currentUser.seat_status = status;
+      state.currentUser.seat_note = note;
+      const uRec = state.users.find((x) => x.id === state.currentUser.id);
+      if (uRec) { uRec.seat_status = status; uRec.seat_note = note; }
+      const lbl = document.getElementById("mySeatLabel");
+      if (lbl) lbl.textContent = status;
+      document.querySelectorAll("#seatBtns button").forEach((btn) => {
+        const s = btn.dataset.status;
+        btn.className = s === status ? (s === "Available" ? "active-avail" : s === "Short Break" ? "active-break" : "active-away") : "";
+      });
       toast(`Seat status updated: ${status}`);
-      await refreshState();
+      if (currentPage === "dashboard") render("dashboard");
     } catch (err) { toast(err.message); }
   });
 
